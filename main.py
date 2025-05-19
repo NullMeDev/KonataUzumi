@@ -76,8 +76,10 @@ def db_connect():
 
 def is_item_seen(conn, item):
     now = datetime.datetime.utcnow()
-    ft = item.get("type","political_news")
-    cfg = CONF["feed_types"][ft]
+    raw_type = item.get("type", "political_news")
+    # normalize any unknown types (e.g. 'rss', 'html') into our political_news bucket
+    ft = raw_type if raw_type in CONF["feed_types"] else "political_news"
+    cfg = CONF["feed_types"].get(ft, {})
     row = conn.execute(
         "SELECT posted_at, expires_at FROM seen_items WHERE hash=?",
         (item.hash,)
@@ -87,15 +89,16 @@ def is_item_seen(conn, item):
     posted, expires = map(datetime.datetime.fromisoformat, row)
     if now > expires:
         return False
-    # similarity check
+    # similarity check to avoid near-duplicates
     similar = conn.execute(
         "SELECT title FROM seen_items WHERE type=? AND hash!=?",
         (ft, item.hash)
     ).fetchall()
+    thresh = cfg.get("similarity_threshold", 90)
     for (other_title,) in similar:
-        if token_set_ratio(item["title"], other_title) > cfg["similarity_threshold"]:
+        if token_set_ratio(item["title"], other_title) > thresh:
             return True
-    return True
+    return False
 
 # ────────────────────────────────────────────────────────────────────
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
@@ -109,7 +112,7 @@ async def fetch_feed(src: dict, client: httpx.AsyncClient) -> list[Item]:
     try:
         resp = await client.get(src["url"], timeout=20)
         resp.raise_for_status()
-        ctype = resp.headers.get("Content-Type","")
+        ctype = resp.headers.get("Content-Type", "")
         if "xml" not in ctype and "rss" not in ctype:
             logger.warning(f"Skipping non-XML feed {src['name']} ({ctype})")
             return []
@@ -118,9 +121,9 @@ async def fetch_feed(src: dict, client: httpx.AsyncClient) -> list[Item]:
             logger.warning(f"Malformed feed {src['name']}: {feed.bozo_exception}")
         items = []
         for e in feed.entries[:20]:
-            title = e.get("title","")[:120]
-            link  = e.get("link","")
-            body  = (e.get("summary","") or "")[:300]
+            title = e.get("title", "")[:120]
+            link  = e.get("link", "")
+            body  = (e.get("summary", "") or "")[:300]
             if not (title and link):
                 continue
             items.append(Item(
@@ -129,7 +132,7 @@ async def fetch_feed(src: dict, client: httpx.AsyncClient) -> list[Item]:
                 body=body,
                 source=src["name"],
                 type="rss",
-                tags=src.get("tags",[]),
+                tags=src.get("tags", []),
                 fetched=datetime.datetime.utcnow().isoformat()
             ))
         return items
@@ -152,8 +155,8 @@ def parse_html(src: dict, html: str) -> list[Item]:
             url=link,
             body=body,
             source=src["name"],
-            type=src.get("type","html"),
-            tags=src.get("tags",[]),
+            type=src.get("type", "html"),
+            tags=src.get("tags", []),
             fetched=datetime.datetime.utcnow().isoformat()
         ))
     return out
@@ -192,7 +195,7 @@ def post_to_discord(trending: list[tuple[Item,str]], others: list[Item]):
             "value": item["url"],
             "inline": False
         })
-    payload = {"embeds":[embed]}
+    payload = {"embeds": [embed]}
     for hook in WEBHOOKS:
         try:
             r = requests.post(hook, json=payload)
@@ -210,8 +213,8 @@ def main(dry_run=False, max_items=None, skip_summary=False):
     client = httpx.AsyncClient(headers=HEADERS)
 
     # schedule fetches
-    rss_tasks  = [fetch_feed(src, client) for src in CONF.get("rss",[])]
-    html_tasks = [fetch_html_content(src["url"], client) for src in CONF.get("html",[])]
+    rss_tasks  = [fetch_feed(src, client) for src in CONF.get("rss", [])]
+    html_tasks = [fetch_html_content(src["url"], client) for src in CONF.get("html", [])]
 
     # run fetches in parallel
     results = asyncio.get_event_loop().run_until_complete(
@@ -226,17 +229,17 @@ def main(dry_run=False, max_items=None, skip_summary=False):
         if isinstance(res, Exception):
             continue
         if idx < n_rss:
-            rss_items += [i for i in res if not is_item_seen(conn,i)]
+            rss_items += [i for i in res if not is_item_seen(conn, i)]
         else:
             src = CONF["html"][idx - n_rss]
-            html_items += [i for i in parse_html(src, res) if not is_item_seen(conn,i)]
+            html_items += [i for i in parse_html(src, res) if not is_item_seen(conn, i)]
 
     all_new = sorted(rss_items + html_items,
                      key=lambda i: i["fetched"], reverse=True)
 
     # optionally limit
     if max_items:
-        all_new = all_new[: max_items * 2 ]
+        all_new = all_new[: max_items * 2]
 
     # split top 6 vs rest
     trending = all_new[:6]
@@ -267,7 +270,7 @@ def main(dry_run=False, max_items=None, skip_summary=False):
     # live post
     if trending or others:
         post_to_discord(
-            trending=[(item, summaries.get(item.hash,"")) for item in trending],
+            trending=[(item, summaries.get(item.hash, "")) for item in trending],
             others=others
         )
 
