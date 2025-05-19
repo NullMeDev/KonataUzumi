@@ -1,3 +1,4 @@
+# .github/workflows/news_feed.yml
 name: News Feed
 
 on:
@@ -5,7 +6,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '*/24 * * * *'   # every 24 minutes
+    - cron: '*/24 * * * *'
 
 jobs:
   scrape_and_post:
@@ -18,10 +19,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libxml2-dev \
-            libxslt1-dev \
-            python3-dev
+          sudo apt-get install -y libxml2-dev libxslt1-dev python3-dev
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v4
@@ -39,8 +37,8 @@ jobs:
       - name: Install dependencies
         run: pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Run News Feed Bot (dry)
-        run: python3 cli.py --dry-run
+      - name: Run News Feed Bot
+        run: python3 cli.py
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOKS:  ${{ secrets.DISCORD_WEBHOOKS }}
