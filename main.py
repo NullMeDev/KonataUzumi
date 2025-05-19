@@ -53,7 +53,6 @@ HEADERS = {
     )
 }
 
-
 # ─────────────────── ITEM & DB ───────────────────────────
 class Item(dict):
     def __init__(self, **kw):
@@ -228,7 +227,16 @@ def main():
     all_new = sorted(rss_items + html_items, key=lambda it: it["fetched"], reverse=True)
     trending = all_new[:6]
     others = all_new[6:]
-    summaries = {it.hash: summarize(it["body"]) for it in trending}
+
+    # summarize each trending item, but don’t let failures abort
+    summaries = {}
+    for it in trending:
+        try:
+            summaries[it.hash] = summarize(it["body"])
+        except Exception as e:
+            logger.error(f"Summarization failed for {it['url']}: {e}")
+            summaries[it.hash] = "(summary unavailable)"
+
     if trending or others:
         post([(it, summaries.get(it.hash, "")) for it in trending], others)
 
