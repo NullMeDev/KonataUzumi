@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced Political News Scraper with 🔥 flags on top 6, summaries for trending items,
-and short listings for the rest.
+Enhanced Political News Scraper with parallel RSS+HTML fetch,
+🔥 flags on the top 6, three-paragraph summaries, and listing of others.
 """
 
 import argparse
@@ -12,6 +12,7 @@ import sqlite3
 import logging
 import time
 import hashlib
+import sys
 
 import feedparser
 import httpx
@@ -33,13 +34,21 @@ logger = logging.getLogger(__name__)
 ROOT = os.path.dirname(__file__)
 CONF = yaml.safe_load(open(os.path.join(ROOT, "config/sources.yml")))
 DB_PATH = os.path.join(ROOT, "data/deals.sqlite")
-
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Discord webhooks
 hooks = os.getenv("DISCORD_WEBHOOKS") or os.getenv("DISCORD_WEBHOOK", "")
 WEBHOOKS = [h.strip() for h in hooks.split(",") if h.strip()]
 logger.info(f"Webhooks: {WEBHOOKS}")
+
+# Use a realistic browser UA to avoid 403s on .gov pages
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36"
+    )
+}
 
 # ────────────────────────── ITEM & DB ────────────────────────────
 class Item(dict):
@@ -78,175 +87,194 @@ def is_item_seen(conn, item):
     posted, expires = map(datetime.datetime.fromisoformat, row)
     if now > expires:
         return False
-    # avoid near-duplicates
+    # similarity check
     similar = conn.execute(
         "SELECT title FROM seen_items WHERE type=? AND hash!=?",
         (ft, item.hash)
     ).fetchall()
-    for (other,) in similar:
-        if token_set_ratio(item["title"], other) > cfg["similarity_threshold"]:
+    for (other_title,) in similar:
+        if token_set_ratio(item["title"], other_title) > cfg["similarity_threshold"]:
             return True
     return True
 
 # ────────────────────────────────────────────────────────────────────
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(2, 30))
-async def fetch_html(url, client: httpx.AsyncClient):
-    r = await client.get(url, timeout=15)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
+async def fetch_html_content(url: str, client: httpx.AsyncClient) -> str:
+    r = await client.get(url, timeout=20)
     r.raise_for_status()
     return r.text
 
-def scrape_rss(src):
-    logger.info(f"RSS → {src['name']}")
-    feed = feedparser.parse(src["url"])
-    if feed.bozo:
-        logger.error(f"RSS error {feed.bozo_exception}")
+async def fetch_feed(src: dict, client: httpx.AsyncClient) -> list[Item]:
+    """Fetch an RSS feed URL, skip if not XML, parse up to 20 entries."""
+    try:
+        resp = await client.get(src["url"], timeout=20)
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type","")
+        if "xml" not in ctype and "rss" not in ctype:
+            logger.warning(f"Skipping non-XML feed {src['name']} ({ctype})")
+            return []
+        feed = feedparser.parse(resp.text)
+        if feed.bozo:
+            logger.warning(f"Malformed feed {src['name']}: {feed.bozo_exception}")
+        items = []
+        for e in feed.entries[:20]:
+            title = e.get("title","")[:120]
+            link  = e.get("link","")
+            body  = (e.get("summary","") or "")[:300]
+            if not (title and link):
+                continue
+            items.append(Item(
+                title=title,
+                url=link,
+                body=body,
+                source=src["name"],
+                type="rss",
+                tags=src.get("tags",[]),
+                fetched=datetime.datetime.utcnow().isoformat()
+            ))
+        return items
+    except Exception as e:
+        logger.error(f"Error fetching RSS {src['name']}: {e}")
         return []
-    out = []
-    for e in feed.entries[:20]:
-        title = e.get("title","")[:120]
-        link  = e.get("link","")
-        body  = (e.get("summary","") or "")[:500]
-        if not (title and link): continue
-        it = Item(
-          title=title, url=link, body=body,
-          source=src["name"], type="rss",
-          tags=src.get("tags",[]), fetched=datetime.datetime.utcnow().isoformat()
-        )
-        out.append(it)
-    return out
 
-async def scrape_html(src, client):
-    logger.info(f"HTML → {src['name']}")
-    html = await fetch_html(src["url"], client)
+def parse_html(src: dict, html: str) -> list[Item]:
+    """Parse HTML page with a CSS selector into items."""
     soup = BeautifulSoup(html, "lxml")
     out = []
     for el in soup.select(src["selector"]):
-        txt = el.get_text(strip=True)[:120] or src["name"]
-        link = el.select_one("a[href]")
-        url  = link["href"] if link else src["url"]
-        it = Item(
-          title=txt, url=url,
-          body="".join(el.stripped_strings)[:500],
-          source=src["name"], type="html",
-          tags=src.get("tags",[]), fetched=datetime.datetime.utcnow().isoformat()
-        )
-        out.append(it)
+        title = el.get("alt") or el.get_text(strip=True) or src["name"]
+        title = title[:120]
+        body = "".join(el.stripped_strings)[:300]
+        a = el.select_one("a[href]")
+        link = a["href"] if a else src["url"]
+        out.append(Item(
+            title=title,
+            url=link,
+            body=body,
+            source=src["name"],
+            type=src.get("type","html"),
+            tags=src.get("tags",[]),
+            fetched=datetime.datetime.utcnow().isoformat()
+        ))
     return out
 
-# ────────────────────────────────────────────────────────────────────
-def summarize(text):
+# ─────────────────────── SUMMARY UTIL ──────────────────────────
+def summarize(text: str) -> str:
     resp = openai.ChatCompletion.create(
-      model="gpt-3.5-turbo",
-      messages=[
-        {"role":"system","content":"You summarize political news into three paragraphs."},
-        {"role":"user","content":text}
-      ],
-      temperature=0.5,
-      max_tokens=600
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role":"system", "content":"Summarize this political news article into three concise paragraphs."},
+            {"role":"user",   "content":text}
+        ],
+        temperature=0.5,
+        max_tokens=600
     )
     return resp.choices[0].message.content.strip()
 
-# ─────────────────────────── MAIN ─────────────────────────────
-def post_to_discord(trending, others):
+# ─────────────────────────── POST ─────────────────────────────
+def post_to_discord(trending: list[tuple[Item,str]], others: list[Item]):
     now = datetime.datetime.utcnow().isoformat()
     embed = {
-      "title": f"📰 {len(trending)} trending + {len(others)} more",
-      "color": CONF["colors"]["default"],
-      "timestamp": now,
-      "fields": []
+        "title": f"📰 {len(trending)} trending + {len(others)} more",
+        "color": CONF["colors"]["default"],
+        "timestamp": now,
+        "fields": []
     }
-    # Trending first
     for item, summary in trending:
-      embed["fields"].append({
-        "name": f"🔥 {item['title']}",
-        "value": f"{summary}\n{item['url']}",
-        "inline": False
-      })
-    # Then the rest
+        embed["fields"].append({
+            "name": f"🔥 {item['title']}",
+            "value": f"{summary}\n{item['url']}",
+            "inline": False
+        })
     for item in others:
-      embed["fields"].append({
-        "name": item["title"],
-        "value": item["url"],
-        "inline": False
-      })
+        embed["fields"].append({
+            "name": item["title"],
+            "value": item["url"],
+            "inline": False
+        })
     payload = {"embeds":[embed]}
     for hook in WEBHOOKS:
-      try:
-        r = requests.post(hook, json=payload)
-        if r.status_code!=204:
-          logger.error(f"Post failed {r.status_code} {r.text}")
-      except Exception as e:
-        logger.error(f"Error posting: {e}")
-      time.sleep(1)
+        try:
+            r = requests.post(hook, json=payload)
+            if r.status_code != 204:
+                logger.error(f"Post failed {r.status_code}: {r.text}")
+        except Exception as e:
+            logger.error(f"Discord post error: {e}")
+        time.sleep(1)
 
+# ─────────────────────────── MAIN ─────────────────────────────
 def main(dry_run=False, max_items=None, skip_summary=False):
     conn = db_connect()
 
-    # 1) collect
+    # prepare async client
+    client = httpx.AsyncClient(headers=HEADERS)
+
+    # schedule fetches
+    rss_tasks  = [fetch_feed(src, client) for src in CONF.get("rss",[])]
+    html_tasks = [fetch_html_content(src["url"], client) for src in CONF.get("html",[])]
+
+    # run fetches in parallel
+    results = asyncio.get_event_loop().run_until_complete(
+        asyncio.gather(*(rss_tasks + html_tasks), return_exceptions=True)
+    )
+
+    # split results back
     rss_items = []
-    for src in CONF.get("rss",[]):
-        try:
-            items = scrape_rss(src)
-            rss_items += [i for i in items if not is_item_seen(conn,i)]
-        except Exception as e:
-            logger.error(e)
-
-    # 2) html fallback
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    client = httpx.AsyncClient()
-    tasks = [scrape_html(s, client) for s in CONF.get("html",[])]
-    results = loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-    html_items=[]
-    for src,res in zip(CONF.get("html",[]),results):
-        if isinstance(res,Exception):
-            logger.error(res)
+    html_items = []
+    n_rss = len(rss_tasks)
+    for idx, res in enumerate(results):
+        if isinstance(res, Exception):
+            continue
+        if idx < n_rss:
+            rss_items += [i for i in res if not is_item_seen(conn,i)]
         else:
-            html_items += [i for i in res if not is_item_seen(conn,i)]
+            src = CONF["html"][idx - n_rss]
+            html_items += [i for i in parse_html(src, res) if not is_item_seen(conn,i)]
 
-    all_new = sorted(rss_items+html_items,
+    all_new = sorted(rss_items + html_items,
                      key=lambda i: i["fetched"], reverse=True)
 
-    # limit total if asked
+    # optionally limit
     if max_items:
-        all_new = all_new[:max_items*2]  # fetch a few extra so trending picks make sense
+        all_new = all_new[: max_items * 2 ]
 
-    # split trending vs others
+    # split top 6 vs rest
     trending = all_new[:6]
     others   = all_new[6:]
 
-    # summarize only trending
+    # summarize trending
     summaries = {}
     if not skip_summary:
-      for it in trending:
-        try:
-          summaries[it.hash] = summarize(it["body"])
-        except Exception as e:
-          logger.error(f"Summarize failed: {e}")
-          summaries[it.hash] = "(summary failed)"
+        for item in trending:
+            try:
+                summaries[item.hash] = summarize(item["body"])
+            except Exception as e:
+                logger.error(f"Summarize error {item['url']}: {e}")
+                summaries[item.hash] = "(summary failed)"
 
-    # dry-run?
+    # dry-run prints
     if dry_run:
-      print("🔥 Trending:")
-      for it in trending:
-        s = summaries.get(it.hash, "(no summary)")
-        print(f"🔥 {it['title']}\n{s}\n{it['url']}\n")
-      print("— Other new articles:")
-      for it in others:
-        print(f"{it['title']} — {it['url']}")
-      return
+        print("🔥 Trending Articles:")
+        for item in trending:
+            print(f"🔥 {item['title']}")
+            print(summaries.get(item.hash, "(no summary)"))
+            print(item["url"], "\n")
+        print("— Other New Articles:")
+        for item in others:
+            print(f"{item['title']} — {item['url']}")
+        return
 
-    # post live
-    post_to_discord(
-      trending=[(it, summaries.get(it.hash,"")) for it in trending],
-      others=others
-    )
+    # live post
+    if trending or others:
+        post_to_discord(
+            trending=[(item, summaries.get(item.hash,"")) for item in trending],
+            others=others
+        )
 
-if __name__=="__main__":
-    # treat direct call as dry-run by default
+if __name__ == "__main__":
     args = sys.argv
     main(
-      dry_run="--dry-run" in args,
-      max_items=None,
-      skip_summary="--skip-summary" in args
+        dry_run="--dry-run" in args,
+        max_items=None,
+        skip_summary="--skip-summary" in args
     )
