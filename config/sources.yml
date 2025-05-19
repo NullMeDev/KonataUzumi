@@ -1,1 +1,183 @@
+version: 1.2.0
 
+feed_types:
+  political_news:
+    ttl_days: 1
+    similarity_threshold: 90
+
+colors:
+  default: 15844367  # used for political news embeds
+  government: 3447003
+
+rss:
+  - name: USA.gov
+    url: https://www.usa.gov/rss
+    tags: [government]
+    type: political_news
+  - name: White House (News)
+    url: https://www.whitehouse.gov/feed/
+    tags: [government]
+    type: political_news
+  - name: Congress.gov
+    url: https://www.congress.gov/rss
+    tags: [government]
+    type: political_news
+  - name: Supreme Court of the U.S.
+    url: https://www.supremecourt.gov/rss
+    tags: [government]
+    type: political_news
+  - name: Federal Register
+    url: https://www.federalregister.gov/feeds
+    tags: [government]
+    type: political_news
+  - name: CDC News Releases
+    url: https://tools.cdc.gov/api/v2/resources/media/404952.rss
+    tags: [government]
+    type: political_news
+  - name: FDA Newsroom
+    url: https://www.fda.gov/about-fda/fda-newsroom/rss-feed
+    tags: [government]
+    type: political_news
+  - name: NIH News Releases
+    url: https://www.nih.gov/news-events/news-releases/rss
+    tags: [government]
+    type: political_news
+  - name: FEMA News Releases
+    url: https://www.fema.gov/about/newsroom/feed
+    tags: [government]
+    type: political_news
+  - name: EPA Newsroom
+    url: https://www.epa.gov/newsroom/rss.xml
+    tags: [government]
+    type: political_news
+  - name: NASA Breaking News
+    url: https://www.nasa.gov/rss/dyn/breaking_news.rss
+    tags: [government]
+    type: political_news
+  - name: NOAA News
+    url: https://www.noaa.gov/media-release/rss.xml
+    tags: [government]
+    type: political_news
+  - name: DOE News
+    url: https://www.energy.gov/news/rss.xml
+    tags: [government]
+    type: political_news
+  - name: DHS News
+    url: https://www.dhs.gov/news-releases/rss.xml
+    tags: [government]
+    type: political_news
+  - name: DoD News
+    url: https://www.defense.gov/News/News-Releases/rss
+    tags: [government]
+    type: political_news
+  - name: FBI News
+    url: https://www.fbi.gov/feeds/atom/news_feed.xml
+    tags: [government]
+    type: political_news
+  - name: State Dept. News
+    url: https://www.state.gov/rss
+    tags: [government]
+    type: political_news
+  - name: Commerce Dept. News
+    url: https://www.commerce.gov/rss/news-releases.xml
+    tags: [government]
+    type: political_news
+  - name: Treasury Dept. News
+    url: https://home.treasury.gov/rss.xml
+    tags: [government]
+    type: political_news
+  - name: SBA News Releases
+    url: https://www.sba.gov/feeds
+    tags: [government]
+    type: political_news
+  - name: Education Dept. News
+    url: https://www.ed.gov/newsfeed.xml
+    tags: [government]
+    type: political_news
+  - name: VA News Releases
+    url: https://www.va.gov/opa/publications/rss.cfm
+    tags: [government]
+    type: political_news
+  - name: NSA News
+    url: https://www.nsa.gov/rss.xml
+    tags: [government]
+    type: political_news
+
+  # Right-leaning media
+  - name: Fox News Politics
+    url: https://feeds.foxnews.com/foxnews/politics
+    tags: [right]
+    type: political_news
+  - name: Breitbart
+    url: https://www.breitbart.com/feed/
+    tags: [right]
+    type: political_news
+  - name: The Daily Wire
+    url: https://www.dailywire.com/rss
+    tags: [right]
+    type: political_news
+  - name: Newsmax
+    url: https://www.newsmax.com/rss
+    tags: [right]
+    type: political_news
+  - name: National Review
+    url: https://www.nationalreview.com/rss
+    tags: [right]
+    type: political_news
+  - name: Washington Times
+    url: https://www.washingtontimes.com/rss/headlines/system/public/rss.xml
+    tags: [right]
+    type: political_news
+
+  # Left-leaning media
+  - name: CNN Politics
+    url: https://rss.cnn.com/rss/cnn_allpolitics.rss
+    tags: [left]
+    type: political_news
+  - name: MSNBC Latest
+    url: https://www.msnbc.com/feeds/latest
+    tags: [left]
+    type: political_news
+  - name: NYT Politics
+    url: https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
+    tags: [left]
+    type: political_news
+  - name: Washington Post Politics
+    url: https://feeds.washingtonpost.com/rss/politics
+    tags: [left]
+    type: political_news
+  - name: HuffPost Politics
+    url: https://www.huffpost.com/section/politics/feed
+    tags: [left]
+    type: political_news
+  - name: Vox Politics
+    url: https://www.vox.com/rss/index.xml
+    tags: [left]
+    type: political_news
+  - name: Salon
+    url: https://www.salon.com/feed
+    tags: [left]
+    type: political_news
+  - name: Mother Jones
+    url: https://www.motherjones.com/feed
+    tags: [left]
+    type: political_news
+  - name: NPR Politics
+    url: https://www.npr.org/rss/rss.php?id=1014
+    tags: [left]
+    type: political_news
+
+html:
+  # fallback scrapers for any that lack RSS
+  - name: Supreme Court of the U.S.
+    url: https://www.supremecourt.gov
+    selector: article
+    tags: [government]
+    type: political_news
+  - name: Congress.gov
+    url: https://www.congress.gov
+    selector: article
+    tags: [government]
+    type: political_news
+
+categories: {}
