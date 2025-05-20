@@ -1,229 +1,77 @@
-#!/usr/bin/env python3
-"""
-Political News Bot — live mode only
-Fetches RSS+HTML in parallel, 🔥 flags top 6, summarizes them concurrently via OpenAI v1,
-lists the rest, and posts directly to Discord.
-"""
+#!/usr/bin/env python3 """ Political News Bot — ultra performant, cached, batched, and hybrid-summarizer. Fetches RSS via HEAD/GET, HTML in parallel, de-dupes, caches summaries, batch-summarizes trending stories with OpenAI (fallback to local BART), stores results and posts to Discord every 24 minutes. """ import os import sys import time import sqlite3 import hashlib import logging import asyncio import datetime
 
-import asyncio
-import datetime
-import os
-import sqlite3
-import logging
-import time
-import hashlib
-import sys
+import yaml import httpx import feedparser import requests import transformers from bs4 import BeautifulSoup from rapidfuzz.fuzz import token_set_ratio from tenacity import retry, stop_after_attempt, wait_exponential from openai import OpenAI
 
-import feedparser
-import httpx
-import yaml
-import requests
-from openai import OpenAI
-from bs4 import BeautifulSoup
-from rapidfuzz.fuzz import token_set_ratio
-from tenacity import retry, stop_after_attempt, wait_exponential
+───────────────── CONFIG ─────────────────
 
-# ───────────────────── CONFIGURATION ─────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s") logger = logging.getLogger(name) ROOT = os.path.dirname(file) CONF = yaml.safe_load(open(os.path.join(ROOT, "config/sources.yml"))) DB_PATH = os.path.join(ROOT, "data/news.sqlite")
 
-ROOT = os.path.dirname(__file__)
-CONF = yaml.safe_load(open(os.path.join(ROOT, "config/sources.yml")))
-DB_PATH = os.path.join(ROOT, "data/deals.sqlite")
+Summarization clients
 
-# instantiate OpenAI v1 client
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) local_summarizer = transformers.pipeline("summarization", model="facebook/bart-large-cnn")
 
-# collect Discord webhooks
-WEBHOOKS = []
-for key in ("DISCORD_WEBHOOKS", "DISCORD_WEBHOOK"):
-    val = os.getenv(key)
-    if val:
-        WEBHOOKS += [h.strip() for h in val.split(",") if h.strip()]
+Discord
 
-# browser User-Agent to avoid 403s
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/114.0.0.0 Safari/537.36"
-    )
-}
+WEBHOOKS = [] for k in ("DISCORD_WEBHOOKS","DISCORD_WEBHOOK"):  # comma-separated if os.getenv(k): WEBHOOKS += [u.strip() for u in os.getenv(k).split(",")]
 
-# ─────────────────── ITEM & DB ───────────────────────────
-class Item(dict):
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.hash = hashlib.md5(f"{self.get('title')}|{self.get('url')}".encode()).hexdigest()
+HEADERS = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " "AppleWebKit/537.36 (KHTML, like Gecko) " "Chrome/100.0.0.0 Safari/537.36"}
 
-def db_connect():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS seen_items (
-        hash TEXT PRIMARY KEY,
-        type TEXT,
-        title TEXT,
-        posted_at TEXT,
-        expires_at TEXT
-      )
-    """)
-    return conn
+─────────────── DB ─────────────────
 
-def is_item_seen(conn, item):
-    now = datetime.datetime.utcnow()
-    raw = item.get("type", "political_news")
-    ft = raw if raw in CONF["feed_types"] else "political_news"
-    cfg = CONF["feed_types"][ft]
-    row = conn.execute(
-        "SELECT posted_at,expires_at FROM seen_items WHERE hash=?", (item.hash,)
-    ).fetchone()
-    if not row:
-        return False
-    posted, expires = map(datetime.datetime.fromisoformat, row)
-    if now > expires:
-        return False
-    for (other,) in conn.execute(
-        "SELECT title FROM seen_items WHERE type=? AND hash!=?", (ft, item.hash)
-    ):
-        if token_set_ratio(item["title"], other) > cfg["similarity_threshold"]:
-            return True
-    return False
+def db_connect(): os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) conn = sqlite3.connect(DB_PATH) conn.execute(""" CREATE TABLE IF NOT EXISTS seen_items ( hash TEXT PRIMARY KEY, title TEXT, url TEXT, tags TEXT, fetched TEXT, summary TEXT, etag TEXT )""") return conn
 
-# ───────────────────── FETCH & PARSE ──────────────────────
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(2, 30))
-async def fetch_html(url, client: httpx.AsyncClient) -> str:
-    r = await client.get(url, timeout=20)
-    r.raise_for_status()
-    return r.text
+─────────────── Fetch & HEAD ─────────────────
 
-async def fetch_rss(src: dict, client: httpx.AsyncClient) -> list[Item]:
-    try:
-        r = await client.get(src["url"], timeout=20)
-        r.raise_for_status()
-        ctype = r.headers.get("Content-Type", "")
-        if "xml" not in ctype and "rss" not in ctype:
-            logger.warning(f"Skipping non-XML {src['name']} ({ctype})")
-            return []
-        feed = feedparser.parse(r.text)
-        if feed.bozo:
-            logger.warning(f"Malformed {src['name']}: {feed.bozo_exception}")
-        items = []
-        for e in feed.entries[:20]:
-            t = e.get("title", "")[:120]
-            u = e.get("link", "")
-            b = (e.get("summary", "") or "")[:300]
-            if not (t and u):
-                continue
-            items.append(Item(
-                title=t, url=u, body=b,
-                source=src["name"], type="rss",
-                tags=src.get("tags", []),
-                fetched=datetime.datetime.utcnow().isoformat()
-            ))
-        return items
-    except Exception as e:
-        logger.error(f"RSS fetch error {src['name']}: {e}")
-        return []
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1,max=10)) async def head_feed(url, client): return await client.head(url, timeout=10)
 
-def parse_html(src: dict, html: str) -> list[Item]:
-    soup = BeautifulSoup(html, "lxml")
-    out = []
-    for el in soup.select(src["selector"]):
-        t = el.get("alt") or el.get_text(strip=True) or src["name"]
-        t = t[:120]
-        b = "".join(el.stripped_strings)[:300]
-        a = el.select_one("a[href]")
-        u = a["href"] if a else src["url"]
-        out.append(Item(
-            title=t, url=u, body=b,
-            source=src["name"], type="html",
-            tags=src.get("tags", []),
-            fetched=datetime.datetime.utcnow().isoformat()
-        ))
-    return out
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1,max=10)) async def fetch_feed(src, client): # conditional GET via ETag conn = src['conn'] row = conn.execute("SELECT etag FROM seen_items WHERE url=?",(src['url'],)).fetchone() headers={"If-None-Match":row[0]} if row and row[0] else {} r = await client.get(src['url'], headers=headers, timeout=20) if r.status_code==304: return [] r.raise_for_status() etag = r.headers.get("ETag") feed = feedparser.parse(r.text) items=[] for e in feed.entries[:20]: h = hashlib.md5((e.title+e.link).encode()).hexdigest() items.append({"hash":h,"title":e.title,"url":e.link, "body":(e.summary or e.get('content',[{}])[0].get('value','')), "tags":','.join(src.get('tags',[])),"fetched":datetime.datetime.utcnow().isoformat(),"etag":etag}) return items
 
-# ───────────────────── SUMMARIZATION ──────────────────────
-async def summarize_async(item: Item) -> tuple[str,str]:
-    """Asynchronously summarize an item; returns (hash, summary)."""
-    try:
-        response = await openai_client.chat.completions.acreate(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role":"system","content":"Summarize this political news article into three concise paragraphs."},
-                {"role":"user","content": item["body"]},
-            ],
-            temperature=0.5,
-            max_tokens=600,
-        )
-        return item.hash, response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Summarization failed for {item['url']}: {e}")
-        return item.hash, "(summary unavailable)"
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1,max=10)) async def fetch_html(src, client): r = await client.get(src['url'], timeout=20) r.raise_for_status() soup=BeautifulSoup(r.text,'lxml') out=[] for el in soup.select(src['selector']): title=(el.get('alt') or el.get_text())[:120] body=' '.join(el.stripped_strings)[:300] link=el.select_one('a[href]')['href'] if el.select_one('a[href]') else src['url'] h=hashlib.md5((title+link).encode()).hexdigest() out.append({"hash":h,"title":title,"url":link, "body":body,"tags":','.join(src.get('tags',[])),"fetched":datetime.datetime.utcnow().isoformat(),"etag":None}) return out
 
-# ───────────────────── POST TO DISCORD ────────────────────
-def post(trending: list[tuple[Item,str]], others: list[Item]):
-    now = datetime.datetime.utcnow().isoformat()
-    embed = {
-        "title": f"📰 {len(trending)} trending + {len(others)} more",
-        "color": CONF["colors"]["default"],
-        "timestamp": now,
-        "fields": [],
-    }
-    for it, sm in trending:
-        embed["fields"].append({"name":f"🔥 {it['title']}", "value":f"{sm}\n{it['url']}", "inline":False})
-    for it in others:
-        embed["fields"].append({"name":it["title"], "value":it["url"], "inline":False})
-    for hook in WEBHOOKS:
-        try:
-            r = requests.post(hook, json={"embeds":[embed]})
-            if r.status_code != 204:
-                logger.error(f"Post failed {r.status_code}: {r.text}")
-        except Exception as e:
-            logger.error(f"Discord post error: {e}")
-        time.sleep(1)
+───────────── Detupl and filter ─────────────
 
-# ─────────────────────────── MAIN ───────────────────────────
-def main():
-    conn = db_connect()
-    client = httpx.AsyncClient(headers=HEADERS)
+def dedupe_and_filter(conn, items): new=[] for i in items: if not conn.execute("SELECT 1 FROM seen_items WHERE hash=?",(i['hash'],)).fetchone(): new.append(i) return new
 
-    # launch RSS + HTML fetches
-    rss_tasks = [fetch_rss(s, client) for s in CONF.get("rss", [])]
-    html_tasks = [fetch_html(src["url"], client) for src in CONF.get("html", [])]
+───────────── Summaries ─────────────
 
-    results = asyncio.get_event_loop().run_until_complete(
-        asyncio.gather(*(rss_tasks + html_tasks), return_exceptions=True)
-    )
+def batch_summarize(items): # combine bodies joined="\n---\n".join([it['body'] for it in items]) prompt=f"Summarize the following {len(items)} articles into three paragraphs each, separated by '---':\n{joined}" resp=oai.chat.completions.create(model="gpt-3.5-turbo",messages=[{"role":"user","content":prompt}],max_tokens=3600) out=resp.choices[0].message.content.split('---') return [p.strip() for p in out]
 
-    # split results
-    n_rss = len(rss_tasks)
-    rss_items, html_items = [], []
-    for idx, res in enumerate(results):
-        if isinstance(res, Exception):
-            continue
-        if idx < n_rss:
-            rss_items += [i for i in res if not is_item_seen(conn, i)]
-        else:
-            src = CONF["html"][idx - n_rss]
-            html_items += [i for i in parse_html(src, res) if not is_item_seen(conn, i)]
+────────────── Posting ─────────────
 
-    all_new = sorted(rss_items + html_items, key=lambda i: i["fetched"], reverse=True)
-    trending = all_new[:6]
-    others   = all_new[6:]
+def post_to_discord(trending,others): embed={"title":f"📰{len(trending)} hot +{len(others)} more","color":CONF['colors']['default'],'fields':[]} for it,sm in trending: embed['fields'].append({'name':f"🔥 {it['title']}", 'value':sm+'\n'+it['url']}) for it in others: embed['fields'].append({'name':it['title'],'value':it['url']}) for hook in WEBHOOKS: requests.post(hook,json={'embeds':[embed]})
 
-    # asynchronously summarize top 6
-    summaries = dict(asyncio.get_event_loop().run_until_complete(
-        asyncio.gather(*(summarize_async(it) for it in trending))
-    ))
+─────────────── MAIN ───────────────
 
-    # post live
-    if trending or others:
-        post([(it, summaries.get(it.hash,"")) for it in trending], others)
+def main(): conn=db_connect() client=httpx.AsyncClient(headers=HEADERS)
 
+# fetch RSS and HTML
+for s in CONF['rss']: s['conn']=conn
+rss_tasks=[fetch_feed(s,client) for s in CONF['rss']]
+html_tasks=[fetch_html(s,client) for s in CONF['html']]
+done=asyncio.get_event_loop().run_until_complete(asyncio.gather(*(rss_tasks+html_tasks)))
 
-if __name__ == "__main__":
-    main()
+rss_items=[i for batch in done[:len(rss_tasks)] for i in batch]
+html_items=[i for batch in done[len(rss_tasks):] for i in batch]
+new_items=dedupe_and_filter(conn,rss_items+html_items)
+new_items=sorted(new_items, key=lambda x:x['fetched'],reverse=True)
+
+top6=new_items[:6]; others=new_items[6:]
+
+# summarize top6
+try:
+    sums=batch_summarize(top6)
+except Exception:
+    sums=[local_summarizer(it['body'],max_length=150)[0]['summary_text'] for it in top6]
+trending=list(zip(top6,sums))
+
+# cache into db
+for it in new_items:
+    summary=(dict(trending).get(it['hash']) or None)
+    conn.execute("INSERT OR IGNORE INTO seen_items VALUES(?,?,?,?,?,?,?)",
+                 (it['hash'],it['title'],it['url'],it['tags'],it['fetched'],summary,it.get('etag')))
+conn.commit()
+
+if trending or others: post_to_discord(trending,others)
+
+if name=='main': main()
+
